@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "com.example.family";
+option java_outer_classname = "FamilyProto";
+
+// Mesaj modeli - diske kaydedilecek
+message StoredMessage {
+    int32 id = 1;
+    string text = 2;
+}
+
+// Store sonucu
+message StoreResult {
+    bool success = 1;
+    string error = 2;
+}
+
+// Mesaj ID (GET için)
+message MessageId {
+    int32 id = 1;
+}
+
+// Üye katılma isteği
+message JoinRequest {
+    string host = 1;
+    int32 port = 2;
+}
+
+// Üye katılma yanıtı
+message JoinResponse {
+    bool accepted = 1;
+    repeated string members = 2;  // mevcut aile üyeleri
+}
+
+// Health check
+message HealthRequest {}
+
+message HealthResponse {
+    bool alive = 1;
+    int32 messageCount = 2;  // bu üyede kaç mesaj var
+}
+
+// Yeni üye bildirimi (broadcast)
+message NewMemberNotification {
+    string host = 1;
+    int32 port = 2;
+}
+
+message Empty {}
+
+// Aile servisi - üye yönetimi
+service FamilyService {
+    // Aileye katılma
+    rpc Join(JoinRequest) returns (JoinResponse);
+    
+    // Sağlık kontrolü
+    rpc Health(HealthRequest) returns (HealthResponse);
+    
+    // Yeni üye bildirimi
+    rpc NotifyNewMember(NewMemberNotification) returns (Empty);
+}
+
+// Depolama servisi - mesaj kayıt/okuma
+service StorageService {
+    // Mesajı diske kaydet
+    rpc Store(StoredMessage) returns (StoreResult);
+    
+    // Mesajı diskten oku
+    rpc Retrieve(MessageId) returns (StoredMessage);
+}
