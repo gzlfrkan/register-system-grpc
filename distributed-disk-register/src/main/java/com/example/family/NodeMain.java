@@ -1,256 +1,320 @@
 package com.example.family;
 
-import family.Empty;
-import family.FamilyServiceGrpc;
-import family.FamilyView;
-import family.NodeInfo;
-import family.ChatMessage;
-
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Server;
-import io.grpc.ServerBuilder;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.Socket;
-
-
-import java.io.IOException;
-import java.net.ServerSocket;
-import java.time.LocalDateTime;
-import java.util.List;
+import io.grpc.*;
+import io.grpc.stub.StreamObserver;
+import java.io.*;
+import java.net.*;
+import java.nio.file.*;
+import java.util.*;
 import java.util.concurrent.*;
 
+/**
+ * Ana giriş noktası - Node başlatıcı.
+ * Lider (5555) veya üye olarak çalışır.
+ */
 public class NodeMain {
 
-    private static final int START_PORT = 5555;
-    private static final int PRINT_INTERVAL_SECONDS = 10;
+    private static final String HOST = "127.0.0.1";
+    private static final int BASE_PORT = 5555;
+    private static final int TCP_PORT = 6666;
+    private static final int MAX_PORT = 5565; // max 10 üye
 
-    public static void main(String[] args) throws Exception {
-        String host = "127.0.0.1";
-        int port = findFreePort(START_PORT);
+    private final int grpcPort;
+    private final NodeRegistry registry;
+    private final DiskStorage diskStorage;
+    private Server grpcServer;
+    private TcpServer tcpServer;
+    private int tolerance = 2;
 
-        NodeInfo self = NodeInfo.newBuilder()
-                .setHost(host)
-                .setPort(port)
-                .build();
+    // Mesaj-üye eşlemesi (sadece lider tutar)
+    private final Map<Integer, List<NodeRegistry.Member>> messageMap = new ConcurrentHashMap<>();
 
-        NodeRegistry registry = new NodeRegistry();
-        FamilyServiceImpl service = new FamilyServiceImpl(registry, self);
+    // gRPC client'lar (üyelere bağlantı)
+    private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
 
-        Server server = ServerBuilder
-                .forPort(port)
-                .addService(service)
+    public NodeMain(int grpcPort) {
+        this.grpcPort = grpcPort;
+        this.registry = new NodeRegistry(HOST, grpcPort);
+        this.diskStorage = new DiskStorage("node_" + grpcPort);
+        loadTolerance();
+    }
+
+    private void loadTolerance() {
+        Path configPath = Paths.get("tolerance.conf");
+        if (Files.exists(configPath)) {
+            try {
+                String content = Files.readString(configPath);
+                for (String line : content.split("\n")) {
+                    if (line.startsWith("TOLERANCE=")) {
+                        tolerance = Integer.parseInt(line.substring(10).trim());
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("tolerance.conf okunamadi: " + e.getMessage());
+            }
+        }
+        System.out.println("Tolerance: " + tolerance);
+    }
+
+    public void start() throws Exception {
+        // gRPC server başlat
+        grpcServer = ServerBuilder.forPort(grpcPort)
+                .addService(new FamilyServiceImpl(registry, diskStorage))
+                .addService(new StorageServiceImpl(diskStorage))
                 .build()
                 .start();
 
-                System.out.printf("Node started on %s:%d%n", host, port);
+        System.out.println("Node started on " + HOST + ":" + grpcPort);
 
-                // Eğer bu ilk node ise (port 5555), TCP 6666'da text dinlesin
-                if (port == START_PORT) {
-                    startLeaderTextListener(registry, self);
+        if (registry.isLeader()) {
+            // Lider: TCP server başlat
+            tcpServer = new TcpServer(TCP_PORT, this);
+            tcpServer.start();
+            System.out.println("Leader listening for text on TCP " + HOST + ":" + TCP_PORT);
+        } else {
+            // Üye: Lidere ve diğer üyelere katıl
+            joinFamily();
+        }
+
+        // Periyodik aile listesi basımı
+        startFamilyPrinter();
+
+        // Periyodik health check
+        startHealthChecker();
+
+        // Shutdown hook
+        Runtime.getRuntime().addShutdownHook(new Thread(this::stop));
+
+        // Bekle
+        grpcServer.awaitTermination();
+    }
+
+    public void stop() {
+        System.out.println("Node kapaniyor...");
+        if (tcpServer != null) {
+            tcpServer.stop();
+        }
+        if (grpcServer != null) {
+            grpcServer.shutdown();
+        }
+        for (ManagedChannel channel : channels.values()) {
+            channel.shutdown();
+        }
+    }
+
+    private void joinFamily() {
+        System.out.println("Aileye katiliniyor...");
+
+        // 5555'ten kendi portuna kadar tüm üyelere Join gönder
+        for (int port = BASE_PORT; port < grpcPort; port++) {
+            try {
+                ManagedChannel channel = getChannel(HOST, port);
+                FamilyServiceGrpc.FamilyServiceBlockingStub stub = FamilyServiceGrpc.newBlockingStub(channel);
+
+                JoinRequest request = JoinRequest.newBuilder()
+                        .setHost(HOST)
+                        .setPort(grpcPort)
+                        .build();
+
+                JoinResponse response = stub.join(request);
+
+                if (response.getAccepted()) {
+                    System.out.println("Aileye katildi via " + HOST + ":" + port);
+
+                    // Mevcut üyeleri ekle
+                    for (String memberAddr : response.getMembersList()) {
+                        String[] parts = memberAddr.split(":");
+                        if (parts.length == 2) {
+                            registry.addMember(parts[0], Integer.parseInt(parts[1]));
+                        }
+                    }
                 }
-
-                discoverExistingNodes(host, port, registry, self);
-                startFamilyPrinter(registry, self);
-                startHealthChecker(registry, self);
-
-                server.awaitTermination();
-
-
-
-
-    }
-
-    private static void startLeaderTextListener(NodeRegistry registry, NodeInfo self) {
-    // Sadece lider (5555 portlu node) bu methodu çağırmalı
-    new Thread(() -> {
-        try (ServerSocket serverSocket = new ServerSocket(6666)) {
-            System.out.printf("Leader listening for text on TCP %s:%d%n",
-                    self.getHost(), 6666);
-
-            while (true) {
-                Socket client = serverSocket.accept();
-                new Thread(() -> handleClientTextConnection(client, registry, self)).start();
+            } catch (Exception e) {
+                // Bu port'ta kimse yok, devam
             }
-
-        } catch (IOException e) {
-            System.err.println("Error in leader text listener: " + e.getMessage());
-        }
-    }, "LeaderTextListener").start();
-}
-
-private static void handleClientTextConnection(Socket client,
-                                               NodeRegistry registry,
-                                               NodeInfo self) {
-    System.out.println("New TCP client connected: " + client.getRemoteSocketAddress());
-    try (BufferedReader reader = new BufferedReader(
-            new InputStreamReader(client.getInputStream()))) {
-
-        String line;
-        while ((line = reader.readLine()) != null) {
-            String text = line.trim();
-            if (text.isEmpty()) continue;
-
-            long ts = System.currentTimeMillis();
-
-            // Kendi üstüne de yaz
-            System.out.println("📝 Received from TCP: " + text);
-
-            ChatMessage msg = ChatMessage.newBuilder()
-                    .setText(text)
-                    .setFromHost(self.getHost())
-                    .setFromPort(self.getPort())
-                    .setTimestamp(ts)
-                    .build();
-
-            // Tüm family üyelerine broadcast et
-            broadcastToFamily(registry, self, msg);
-        }
-
-    } catch (IOException e) {
-        System.err.println("TCP client handler error: " + e.getMessage());
-    } finally {
-        try { client.close(); } catch (IOException ignored) {}
-    }
-}
-
-private static void broadcastToFamily(NodeRegistry registry,
-                                      NodeInfo self,
-                                      ChatMessage msg) {
-
-    List<NodeInfo> members = registry.snapshot();
-
-    for (NodeInfo n : members) {
-        // Kendimize tekrar gönderme
-        if (n.getHost().equals(self.getHost()) && n.getPort() == self.getPort()) {
-            continue;
-        }
-
-        ManagedChannel channel = null;
-        try {
-            channel = ManagedChannelBuilder
-                    .forAddress(n.getHost(), n.getPort())
-                    .usePlaintext()
-                    .build();
-
-            FamilyServiceGrpc.FamilyServiceBlockingStub stub =
-                    FamilyServiceGrpc.newBlockingStub(channel);
-
-            stub.receiveChat(msg);
-
-            System.out.printf("Broadcasted message to %s:%d%n", n.getHost(), n.getPort());
-
-        } catch (Exception e) {
-            System.err.printf("Failed to send to %s:%d (%s)%n",
-                    n.getHost(), n.getPort(), e.getMessage());
-        } finally {
-            if (channel != null) channel.shutdownNow();
         }
     }
-}
 
+    private ManagedChannel getChannel(String host, int port) {
+        String key = host + ":" + port;
+        return channels.computeIfAbsent(key, k -> ManagedChannelBuilder.forAddress(host, port)
+                .usePlaintext()
+                .build());
+    }
 
-    private static int findFreePort(int startPort) {
-        int port = startPort;
-        while (true) {
-            try (ServerSocket ignored = new ServerSocket(port)) {
+    private void startFamilyPrinter() {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        executor.scheduleAtFixedRate(() -> {
+            registry.printFamily();
+            System.out.println("Mesaj sayisi: " + diskStorage.getMessageCount());
+        }, 10, 10, TimeUnit.SECONDS);
+    }
+
+    private void startHealthChecker() {
+        if (!registry.isLeader())
+            return;
+
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        executor.scheduleAtFixedRate(() -> {
+            for (NodeRegistry.Member member : registry.getAliveMembers()) {
+                try {
+                    ManagedChannel channel = getChannel(member.host, member.port);
+                    FamilyServiceGrpc.FamilyServiceBlockingStub stub = FamilyServiceGrpc.newBlockingStub(channel);
+
+                    HealthResponse response = stub.health(HealthRequest.newBuilder().build());
+                    if (!response.getAlive()) {
+                        registry.markDead(member.host, member.port);
+                    }
+                } catch (Exception e) {
+                    registry.markDead(member.host, member.port);
+                }
+            }
+        }, 5, 5, TimeUnit.SECONDS);
+    }
+
+    // ========== TCP Komut İşleyiciler ==========
+
+    /**
+     * SET komutu: mesajı kaydet ve tolerance kadar üyeye dağıt
+     */
+    public String handleSet(int id, String message) {
+        // 1. Kendine kaydet
+        boolean localSave = diskStorage.save(id, message);
+        if (!localSave) {
+            return "ERROR: Lokal kayit basarisiz";
+        }
+
+        // 2. Tolerance kadar üye seç
+        List<NodeRegistry.Member> selected = registry.selectMembers(tolerance);
+        List<NodeRegistry.Member> successful = new ArrayList<>();
+
+        // 3. Seçilen üyelere gRPC ile gönder
+        for (NodeRegistry.Member member : selected) {
+            try {
+                ManagedChannel channel = getChannel(member.host, member.port);
+                StorageServiceGrpc.StorageServiceBlockingStub stub = StorageServiceGrpc.newBlockingStub(channel);
+
+                StoredMessage msg = StoredMessage.newBuilder()
+                        .setId(id)
+                        .setText(message)
+                        .build();
+
+                StoreResult result = stub.store(msg);
+                if (result.getSuccess()) {
+                    successful.add(member);
+                }
+            } catch (Exception e) {
+                System.err.println("Store hatasi " + member.getAddress() + ": " + e.getMessage());
+                registry.markDead(member.host, member.port);
+            }
+        }
+
+        // 4. Mesaj haritasını güncelle
+        messageMap.put(id, successful);
+
+        System.out.println("SET " + id + " -> " + (successful.size() + 1) + " node'a kaydedildi");
+        return "OK";
+    }
+
+    /**
+     * GET komutu: önce lokal, yoksa üyelerden oku
+     */
+    public String handleGet(int id) {
+        // 1. Önce kendi diskinde ara
+        String content = diskStorage.load(id);
+        if (content != null) {
+            return content;
+        }
+
+        // 2. Mesaj haritasına bak
+        List<NodeRegistry.Member> members = messageMap.get(id);
+        if (members == null || members.isEmpty()) {
+            return "NOT_FOUND";
+        }
+
+        // 3. Üyelerden sırayla dene
+        for (NodeRegistry.Member member : members) {
+            if (!member.alive)
+                continue;
+
+            try {
+                ManagedChannel channel = getChannel(member.host, member.port);
+                StorageServiceGrpc.StorageServiceBlockingStub stub = StorageServiceGrpc.newBlockingStub(channel);
+
+                MessageId request = MessageId.newBuilder().setId(id).build();
+                StoredMessage response = stub.retrieve(request);
+
+                if (!response.getText().isEmpty()) {
+                    return response.getText();
+                }
+            } catch (Exception e) {
+                System.err.println("Retrieve hatasi " + member.getAddress() + ": " + e.getMessage());
+                registry.markDead(member.host, member.port);
+            }
+        }
+
+        return "NOT_FOUND";
+    }
+
+    /**
+     * STATS komutu: tüm üyelerin mesaj sayısını göster
+     */
+    public String handleStats() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== CLUSTER STATS ===\n");
+        sb.append("Tolerance: ").append(tolerance).append("\n");
+        sb.append("Total members: ").append(registry.getMemberCount()).append("\n");
+        sb.append("\n--- Node Message Counts ---\n");
+
+        // Kendim (lider)
+        sb.append("  ").append(registry.getSelf().getAddress())
+                .append(" (leader): ").append(diskStorage.getMessageCount()).append(" messages\n");
+
+        // Diğer üyeler
+        for (NodeRegistry.Member member : registry.getAliveMembers()) {
+            try {
+                ManagedChannel channel = getChannel(member.host, member.port);
+                FamilyServiceGrpc.FamilyServiceBlockingStub stub = FamilyServiceGrpc.newBlockingStub(channel);
+
+                HealthResponse response = stub.health(HealthRequest.newBuilder().build());
+                sb.append("  ").append(member.getAddress())
+                        .append(": ").append(response.getMessageCount()).append(" messages\n");
+            } catch (Exception e) {
+                sb.append("  ").append(member.getAddress()).append(": UNREACHABLE\n");
+                registry.markDead(member.host, member.port);
+            }
+        }
+
+        // Dead üyeler
+        for (NodeRegistry.Member member : registry.getAllMembers()) {
+            if (!member.alive && !member.equals(registry.getSelf())) {
+                sb.append("  ").append(member.getAddress()).append(": DEAD\n");
+            }
+        }
+
+        sb.append("=====================");
+        return sb.toString();
+    }
+
+    // ========== Port Bulma ==========
+
+    private static int findAvailablePort() {
+        for (int port = BASE_PORT; port <= MAX_PORT; port++) {
+            try (ServerSocket ss = new ServerSocket(port)) {
                 return port;
             } catch (IOException e) {
-                port++;
+                // Port kullanımda, sonrakine geç
             }
         }
+        throw new RuntimeException("Kullanilabilir port bulunamadi");
     }
 
-    private static void discoverExistingNodes(String host,
-                                              int selfPort,
-                                              NodeRegistry registry,
-                                              NodeInfo self) {
+    // ========== Main ==========
 
-        for (int port = START_PORT; port < selfPort; port++) {
-            ManagedChannel channel = null;
-            try {
-                channel = ManagedChannelBuilder
-                        .forAddress(host, port)
-                        .usePlaintext()
-                        .build();
-
-                FamilyServiceGrpc.FamilyServiceBlockingStub stub =
-                        FamilyServiceGrpc.newBlockingStub(channel);
-
-                FamilyView view = stub.join(self);
-                registry.addAll(view.getMembersList());
-
-                System.out.printf("Joined through %s:%d, family size now: %d%n",
-                        host, port, registry.snapshot().size());
-
-            } catch (Exception ignored) {
-            } finally {
-                if (channel != null) channel.shutdownNow();
-            }
-        }
+    public static void main(String[] args) throws Exception {
+        int port = findAvailablePort();
+        NodeMain node = new NodeMain(port);
+        node.start();
     }
-
-    private static void startFamilyPrinter(NodeRegistry registry, NodeInfo self) {
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-
-        scheduler.scheduleAtFixedRate(() -> {
-            List<NodeInfo> members = registry.snapshot();
-            System.out.println("======================================");
-            System.out.printf("Family at %s:%d (me)%n", self.getHost(), self.getPort());
-            System.out.println("Time: " + LocalDateTime.now());
-            System.out.println("Members:");
-
-            for (NodeInfo n : members) {
-                boolean isMe = n.getHost().equals(self.getHost()) && n.getPort() == self.getPort();
-                System.out.printf(" - %s:%d%s%n",
-                        n.getHost(),
-                        n.getPort(),
-                        isMe ? " (me)" : "");
-            }
-            System.out.println("======================================");
-        }, 3, PRINT_INTERVAL_SECONDS, TimeUnit.SECONDS);
-    }
-
-    private static void startHealthChecker(NodeRegistry registry, NodeInfo self) {
-    ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-
-    scheduler.scheduleAtFixedRate(() -> {
-        List<NodeInfo> members = registry.snapshot();
-
-        for (NodeInfo n : members) {
-            // Kendimizi kontrol etmeyelim
-            if (n.getHost().equals(self.getHost()) && n.getPort() == self.getPort()) {
-                continue;
-            }
-
-            ManagedChannel channel = null;
-            try {
-                channel = ManagedChannelBuilder
-                        .forAddress(n.getHost(), n.getPort())
-                        .usePlaintext()
-                        .build();
-
-                FamilyServiceGrpc.FamilyServiceBlockingStub stub =
-                        FamilyServiceGrpc.newBlockingStub(channel);
-
-                // Ping gibi kullanıyoruz: cevap bizi ilgilendirmiyor,
-                // sadece RPC'nin hata fırlatmaması önemli.
-                stub.getFamily(Empty.newBuilder().build());
-
-            } catch (Exception e) {
-                // Bağlantı yok / node ölmüş → listeden çıkar
-                System.out.printf("Node %s:%d unreachable, removing from family%n",
-                        n.getHost(), n.getPort());
-                registry.remove(n);
-            } finally {
-                if (channel != null) {
-                    channel.shutdownNow();
-                }
-            }
-        }
-
-    }, 5, 10, TimeUnit.SECONDS); // 5 sn sonra başla, 10 sn'de bir kontrol et
-}
-
 }

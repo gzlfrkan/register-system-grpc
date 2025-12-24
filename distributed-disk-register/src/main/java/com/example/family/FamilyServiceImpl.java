@@ -1,53 +1,55 @@
 package com.example.family;
 
-import family.Empty;
-import family.FamilyServiceGrpc;
-import family.FamilyView;
-import family.NodeInfo;
-import family.ChatMessage;
 import io.grpc.stub.StreamObserver;
 
+/**
+ * FamilyService gRPC implementasyonu.
+ * Üye yönetimi: Join, Health, NotifyNewMember
+ */
 public class FamilyServiceImpl extends FamilyServiceGrpc.FamilyServiceImplBase {
 
     private final NodeRegistry registry;
-    private final NodeInfo self;
+    private final DiskStorage diskStorage;
 
-    public FamilyServiceImpl(NodeRegistry registry, NodeInfo self) {
+    public FamilyServiceImpl(NodeRegistry registry, DiskStorage diskStorage) {
         this.registry = registry;
-        this.self = self;
-        this.registry.add(self);
+        this.diskStorage = diskStorage;
     }
 
     @Override
-    public void join(NodeInfo request, StreamObserver<FamilyView> responseObserver) {
-        registry.add(request);
+    public void join(JoinRequest request, StreamObserver<JoinResponse> responseObserver) {
+        String host = request.getHost();
+        int port = request.getPort();
 
-        FamilyView view = FamilyView.newBuilder()
-                .addAllMembers(registry.snapshot())
+        // Yeni üyeyi ekle
+        registry.addMember(host, port);
+
+        // Mevcut üye listesini döndür
+        JoinResponse response = JoinResponse.newBuilder()
+                .setAccepted(true)
+                .addAllMembers(registry.getMemberAddresses())
                 .build();
 
-        responseObserver.onNext(view);
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+
+        System.out.println("Join kabul edildi: " + host + ":" + port);
+    }
+
+    @Override
+    public void health(HealthRequest request, StreamObserver<HealthResponse> responseObserver) {
+        HealthResponse response = HealthResponse.newBuilder()
+                .setAlive(true)
+                .setMessageCount(diskStorage.getMessageCount())
+                .build();
+
+        responseObserver.onNext(response);
         responseObserver.onCompleted();
     }
 
     @Override
-    public void getFamily(Empty request, StreamObserver<FamilyView> responseObserver) {
-        FamilyView view = FamilyView.newBuilder()
-                .addAllMembers(registry.snapshot())
-                .build();
-
-        responseObserver.onNext(view);
-        responseObserver.onCompleted();
-    }
-
-    // Diğer düğümlerden broadcast mesajı geldiğinde
-    @Override
-    public void receiveChat(ChatMessage request, StreamObserver<Empty> responseObserver) {
-        System.out.println("💬 Incoming message:");
-        System.out.println("  From: " + request.getFromHost() + ":" + request.getFromPort());
-        System.out.println("  Text: " + request.getText());
-        System.out.println("  Timestamp: " + request.getTimestamp());
-        System.out.println("--------------------------------------");
+    public void notifyNewMember(NewMemberNotification request, StreamObserver<Empty> responseObserver) {
+        registry.addMember(request.getHost(), request.getPort());
 
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
