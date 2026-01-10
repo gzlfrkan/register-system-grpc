@@ -108,6 +108,37 @@ public final class FamilyServiceGrpc {
     return getReceiveChatMethod;
   }
 
+  private static volatile io.grpc.MethodDescriptor<family.KeyRequest,
+      family.ValueResponse> getGetValueMethod;
+
+  @io.grpc.stub.annotations.RpcMethod(
+      fullMethodName = SERVICE_NAME + '/' + "GetValue",
+      requestType = family.KeyRequest.class,
+      responseType = family.ValueResponse.class,
+      methodType = io.grpc.MethodDescriptor.MethodType.UNARY)
+  public static io.grpc.MethodDescriptor<family.KeyRequest,
+      family.ValueResponse> getGetValueMethod() {
+    io.grpc.MethodDescriptor<family.KeyRequest, family.ValueResponse> getGetValueMethod;
+    if ((getGetValueMethod = FamilyServiceGrpc.getGetValueMethod) == null) {
+      synchronized (FamilyServiceGrpc.class) {
+        if ((getGetValueMethod = FamilyServiceGrpc.getGetValueMethod) == null) {
+          FamilyServiceGrpc.getGetValueMethod = getGetValueMethod =
+              io.grpc.MethodDescriptor.<family.KeyRequest, family.ValueResponse>newBuilder()
+              .setType(io.grpc.MethodDescriptor.MethodType.UNARY)
+              .setFullMethodName(generateFullMethodName(SERVICE_NAME, "GetValue"))
+              .setSampledToLocalTracing(true)
+              .setRequestMarshaller(io.grpc.protobuf.ProtoUtils.marshaller(
+                  family.KeyRequest.getDefaultInstance()))
+              .setResponseMarshaller(io.grpc.protobuf.ProtoUtils.marshaller(
+                  family.ValueResponse.getDefaultInstance()))
+              .setSchemaDescriptor(new FamilyServiceMethodDescriptorSupplier("GetValue"))
+              .build();
+        }
+      }
+    }
+    return getGetValueMethod;
+  }
+
   /**
    * Creates a new async stub that supports all call types for the service
    */
@@ -176,6 +207,16 @@ public final class FamilyServiceGrpc {
         io.grpc.stub.StreamObserver<family.Empty> responseObserver) {
       io.grpc.stub.ServerCalls.asyncUnimplementedUnaryCall(getReceiveChatMethod(), responseObserver);
     }
+
+    /**
+     * <pre>
+     * Dağıtık GET - diğer düğümlerden değer al
+     * </pre>
+     */
+    default void getValue(family.KeyRequest request,
+        io.grpc.stub.StreamObserver<family.ValueResponse> responseObserver) {
+      io.grpc.stub.ServerCalls.asyncUnimplementedUnaryCall(getGetValueMethod(), responseObserver);
+    }
   }
 
   /**
@@ -228,6 +269,17 @@ public final class FamilyServiceGrpc {
       io.grpc.stub.ClientCalls.asyncUnaryCall(
           getChannel().newCall(getReceiveChatMethod(), getCallOptions()), request, responseObserver);
     }
+
+    /**
+     * <pre>
+     * Dağıtık GET - diğer düğümlerden değer al
+     * </pre>
+     */
+    public void getValue(family.KeyRequest request,
+        io.grpc.stub.StreamObserver<family.ValueResponse> responseObserver) {
+      io.grpc.stub.ClientCalls.asyncUnaryCall(
+          getChannel().newCall(getGetValueMethod(), getCallOptions()), request, responseObserver);
+    }
   }
 
   /**
@@ -265,6 +317,16 @@ public final class FamilyServiceGrpc {
     public family.Empty receiveChat(family.ChatMessage request) {
       return io.grpc.stub.ClientCalls.blockingUnaryCall(
           getChannel(), getReceiveChatMethod(), getCallOptions(), request);
+    }
+
+    /**
+     * <pre>
+     * Dağıtık GET - diğer düğümlerden değer al
+     * </pre>
+     */
+    public family.ValueResponse getValue(family.KeyRequest request) {
+      return io.grpc.stub.ClientCalls.blockingUnaryCall(
+          getChannel(), getGetValueMethod(), getCallOptions(), request);
     }
   }
 
@@ -307,11 +369,23 @@ public final class FamilyServiceGrpc {
       return io.grpc.stub.ClientCalls.futureUnaryCall(
           getChannel().newCall(getReceiveChatMethod(), getCallOptions()), request);
     }
+
+    /**
+     * <pre>
+     * Dağıtık GET - diğer düğümlerden değer al
+     * </pre>
+     */
+    public com.google.common.util.concurrent.ListenableFuture<family.ValueResponse> getValue(
+        family.KeyRequest request) {
+      return io.grpc.stub.ClientCalls.futureUnaryCall(
+          getChannel().newCall(getGetValueMethod(), getCallOptions()), request);
+    }
   }
 
   private static final int METHODID_JOIN = 0;
   private static final int METHODID_GET_FAMILY = 1;
   private static final int METHODID_RECEIVE_CHAT = 2;
+  private static final int METHODID_GET_VALUE = 3;
 
   private static final class MethodHandlers<Req, Resp> implements
       io.grpc.stub.ServerCalls.UnaryMethod<Req, Resp>,
@@ -341,6 +415,10 @@ public final class FamilyServiceGrpc {
         case METHODID_RECEIVE_CHAT:
           serviceImpl.receiveChat((family.ChatMessage) request,
               (io.grpc.stub.StreamObserver<family.Empty>) responseObserver);
+          break;
+        case METHODID_GET_VALUE:
+          serviceImpl.getValue((family.KeyRequest) request,
+              (io.grpc.stub.StreamObserver<family.ValueResponse>) responseObserver);
           break;
         default:
           throw new AssertionError();
@@ -381,6 +459,13 @@ public final class FamilyServiceGrpc {
               family.ChatMessage,
               family.Empty>(
                 service, METHODID_RECEIVE_CHAT)))
+        .addMethod(
+          getGetValueMethod(),
+          io.grpc.stub.ServerCalls.asyncUnaryCall(
+            new MethodHandlers<
+              family.KeyRequest,
+              family.ValueResponse>(
+                service, METHODID_GET_VALUE)))
         .build();
   }
 
@@ -432,6 +517,7 @@ public final class FamilyServiceGrpc {
               .addMethod(getJoinMethod())
               .addMethod(getGetFamilyMethod())
               .addMethod(getReceiveChatMethod())
+              .addMethod(getGetValueMethod())
               .build();
         }
       }
