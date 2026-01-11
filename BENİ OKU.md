@@ -96,30 +96,42 @@ A distributed key-value storage system with automatic replication, multiple I/O 
 
 ## Build & Run
 
-### Build
+### Tek Komutla Başlatma (Önerilen)
+```powershell
+cd "c:\Users\cooll\Desktop\sistem programlama_cool"
+.\baslat.bat
+```
+
+### Farklı Bilgisayarlarda Çalıştırma
+
+**1. Bilgisayar (İlk açan LEADER olur):**
+```powershell
+.\baslat.bat
+```
+
+**2. Bilgisayar (Otomatik FOLLOWER olur):**
+- Aynı klasörü kopyalayın
+- `baslat.bat` çalıştırın
+- Otomatik olarak Leader'ı bulup bağlanacak
+
+> **Not:** Tüm bilgisayarlar aynı ağda (WiFi/LAN) olmalıdır.
+
+### Manuel Başlatma
 ```powershell
 cd "c:\Users\cooll\Desktop\sistem programlama_cool\distributed-disk-register"
 .\mvnw.cmd clean compile
-```
-
-### Run Leader Node
-```powershell
 .\mvnw.cmd exec:java "-Dexec.mainClass=com.example.family.NodeMain" "-Dexec.args=--mode=CLASSIC --tolerance=1"
 ```
 
-### Run Follower Nodes (in separate terminals)
+### Manuel Lider Belirtme (Opsiyonel)
 ```powershell
-.\mvnw.cmd exec:java "-Dexec.mainClass=com.example.family.NodeMain" "-Dexec.args=--mode=MEMORY_MAPPED"
-```
-
-```powershell
-.\mvnw.cmd exec:java "-Dexec.mainClass=com.example.family.NodeMain" "-Dexec.args=--mode=UNBUFFERED"
+.\mvnw.cmd exec:java "-Dexec.mainClass=com.example.family.NodeMain" "-Dexec.args=--leader=192.168.1.100"
 ```
 
 ### Test with HaToKuSe Client
 ```powershell
 cd "c:\Users\cooll\Desktop\HaToKuSe-Client-main\hatokuse-client"
-java HaToKuSeClient --durationMinutes=1 --printEach --keySpace=50
+java HaToKuSeClient --host=<LEADER_IP> --durationMinutes=30
 ```
 
 ---
