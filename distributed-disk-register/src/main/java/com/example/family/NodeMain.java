@@ -20,6 +20,12 @@ import java.net.Socket;
 
 import java.io.IOException;
 import java.net.ServerSocket;
+import java.net.DatagramSocket;
+import java.net.DatagramPacket;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketTimeoutException;
+import java.util.Enumeration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -31,7 +37,9 @@ public class NodeMain {
     private static final int BASLANGIC_PORT = 5555;
     private static final int YAZDIR_ARALIK_SANIYE = 10;
     private static final int TCP_DINLEME_PORT = 6666;
-    private static final String YEREL_ADRES = "127.0.0.1";
+    private static final int UDP_KESIF_PORT = 5554;
+    private static String YEREL_ADRES = "127.0.0.1"; // Dinamik olarak belirlenecek
+    private static String LIDER_ADRES = null; // Keşfedilecek
     private static final DateTimeFormatter ZAMAN_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     // Performans istatistikleri
@@ -45,8 +53,12 @@ public class NodeMain {
     private static ConcurrentHashMap<Integer, String> bellek = new ConcurrentHashMap<>();
     private static DiskIO diskIO;
     private static int tolerance = 1; // Kaç düğüme replike edilecek
+    private static volatile boolean liderMiyim = false;
 
     public static void main(String[] args) throws Exception {
+        // Gerçek ağ IP adresini bul
+        YEREL_ADRES = yerelIPBul();
+
         // Komut satırı argümanlarını işle
         DiskIO.Mode ioMode = DiskIO.Mode.CLASSIC;
         for (String arg : args) {
@@ -60,13 +72,38 @@ public class NodeMain {
                 }
             } else if (arg.startsWith("--tolerance=")) {
                 tolerance = Integer.parseInt(arg.substring("--tolerance=".length()));
+            } else if (arg.startsWith("--leader=")) {
+                LIDER_ADRES = arg.substring("--leader=".length());
             }
         }
 
-        int port = bosPortBul(BASLANGIC_PORT);
+        System.out.println("==========================================");
+        System.out.println("  DISTRIBUTED SYSTEM - COOL VERSION v3.0");
+        System.out.println("  Network Auto-Discovery + Multi-Computer");
+        System.out.println("==========================================");
+        System.out.printf("Local IP: %s%n", YEREL_ADRES);
+
+        // Eğer lider adresi verilmemişse, ağda lider ara
+        if (LIDER_ADRES == null) {
+            System.out.println("Agda lider araniyor...");
+            LIDER_ADRES = liderKesfi();
+        }
+
+        int port;
+        if (LIDER_ADRES == null) {
+            // Lider bulunamadı - ben lider olacağım
+            port = BASLANGIC_PORT;
+            liderMiyim = true;
+            System.out.println("Lider bulunamadi - BEN LIDER OLUYORUM");
+        } else {
+            // Lider bulundu - ona bağlan
+            port = bosPortBul(BASLANGIC_PORT);
+            liderMiyim = false;
+            System.out.printf("Lider bulundu: %s%n", LIDER_ADRES);
+        }
 
         // Her düğüm kendi veri dizinine yazar
-        String veriDizini = "data_" + port;
+        String veriDizini = "data_" + YEREL_ADRES.replace(".", "_") + "_" + port;
         diskIO = new DiskIO(ioMode, veriDizini);
 
         NodeInfo kendim = NodeInfo.newBuilder()
@@ -83,30 +120,168 @@ public class NodeMain {
                 .build()
                 .start();
 
-        System.out.println("==========================================");
-        System.out.println("  DISTRIBUTED SYSTEM - COOL VERSION v2.0");
-        System.out.println("  HaToKuSe Compatible + Replication + I/O Modes");
-        System.out.println("==========================================");
         System.out.printf("Node: %s:%d%n", YEREL_ADRES, port);
         System.out.printf("I/O Mode: %s%n", diskIO.getModeName());
         System.out.printf("Tolerance: %d (data copied to %d nodes)%n", tolerance, tolerance + 1);
         System.out.printf("Data Directory: %s%n", veriDizini);
         System.out.println("Started: " + LocalDateTime.now().format(ZAMAN_FORMAT));
 
-        if (port == BASLANGIC_PORT) {
+        if (liderMiyim) {
             System.out.println("Role: LEADER");
             liderDinleyicisiniBaslat(kayitci, kendim);
+            liderDuyurusunuBaslat(); // UDP broadcast başlat
         } else {
             System.out.println("Role: FOLLOWER");
+            // Lidere bağlan
+            lidereBaglan(LIDER_ADRES, kayitci, kendim);
         }
 
         System.out.println("------------------------------------------");
 
-        mevcutDugumleriKesifEt(YEREL_ADRES, port, kayitci, kendim);
-        istatistikYazicisiniBaslat(kayitci, kendim);
+        if (liderMiyim) {
+            istatistikYazicisiniBaslat(kayitci, kendim);
+        }
         saglikKontrolunuBaslat(kayitci, kendim);
 
         sunucu.awaitTermination();
+    }
+
+    /**
+     * Gerçek ağ IP adresini bulur (127.0.0.1 değil)
+     */
+    private static String yerelIPBul() {
+        try {
+            // Önce aktif ağ bağlantısını bulmaya çalış
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.connect(InetAddress.getByName("8.8.8.8"), 80);
+                String ip = socket.getLocalAddress().getHostAddress();
+                if (!ip.equals("0.0.0.0") && !ip.startsWith("127.")) {
+                    return ip;
+                }
+            } catch (Exception e) {
+                // Devam et
+            }
+
+            // Alternatif yöntem: ağ arayüzlerini tara
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface iface = interfaces.nextElement();
+                if (iface.isLoopback() || !iface.isUp())
+                    continue;
+
+                Enumeration<InetAddress> addresses = iface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress addr = addresses.nextElement();
+                    if (addr instanceof java.net.Inet4Address) {
+                        String ip = addr.getHostAddress();
+                        if (!ip.startsWith("127.")) {
+                            return ip;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("IP bulunamadi: " + e.getMessage());
+        }
+        return "127.0.0.1";
+    }
+
+    /**
+     * UDP broadcast ile ağda lider arar
+     */
+    private static String liderKesfi() {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.setBroadcast(true);
+            socket.setSoTimeout(3000); // 3 saniye bekle
+
+            // Broadcast mesajı gönder
+            String mesaj = "LEADER_SEARCH";
+            byte[] sendData = mesaj.getBytes();
+            DatagramPacket sendPacket = new DatagramPacket(
+                    sendData, sendData.length,
+                    InetAddress.getByName("255.255.255.255"), UDP_KESIF_PORT);
+            socket.send(sendPacket);
+
+            // Yanıt bekle
+            byte[] receiveData = new byte[256];
+            DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
+
+            try {
+                socket.receive(receivePacket);
+                String yanit = new String(receivePacket.getData(), 0, receivePacket.getLength());
+                if (yanit.startsWith("LEADER_HERE:")) {
+                    return yanit.substring("LEADER_HERE:".length());
+                }
+            } catch (SocketTimeoutException e) {
+                // Zaman aşımı - lider yok
+            }
+
+        } catch (Exception e) {
+            System.err.println("Lider arama hatasi: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Leader olarak UDP broadcast dinle ve kendini duyur
+     */
+    private static void liderDuyurusunuBaslat() {
+        new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket(UDP_KESIF_PORT)) {
+                socket.setBroadcast(true);
+                byte[] receiveData = new byte[256];
+
+                System.out.printf("UDP Discovery: Port %d dinleniyor%n", UDP_KESIF_PORT);
+
+                while (true) {
+                    DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
+                    socket.receive(receivePacket);
+
+                    String mesaj = new String(receivePacket.getData(), 0, receivePacket.getLength());
+
+                    if (mesaj.equals("LEADER_SEARCH")) {
+                        // Liderin burada olduğunu bildir
+                        String yanit = "LEADER_HERE:" + YEREL_ADRES;
+                        byte[] sendData = yanit.getBytes();
+                        DatagramPacket sendPacket = new DatagramPacket(
+                                sendData, sendData.length,
+                                receivePacket.getAddress(), receivePacket.getPort());
+                        socket.send(sendPacket);
+
+                        System.out.printf("[UDP] Lider arama yanıtlandı: %s%n",
+                                receivePacket.getAddress().getHostAddress());
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("UDP duyuru hatasi: " + e.getMessage());
+            }
+        }, "LiderDuyurusu").start();
+    }
+
+    /**
+     * Follower olarak lidere bağlan
+     */
+    private static void lidereBaglan(String liderIP, NodeRegistry kayitci, NodeInfo kendim) {
+        ManagedChannel kanal = null;
+        try {
+            kanal = ManagedChannelBuilder
+                    .forAddress(liderIP, BASLANGIC_PORT)
+                    .usePlaintext()
+                    .build();
+
+            FamilyServiceGrpc.FamilyServiceBlockingStub stub = FamilyServiceGrpc.newBlockingStub(kanal);
+
+            FamilyView gorunum = stub.join(kendim);
+            kayitci.addAll(gorunum.getMembersList());
+
+            System.out.printf("Aileye katilindi: %d uye%n", kayitci.snapshot().size());
+
+        } catch (Exception e) {
+            System.err.println("Lidere baglanti hatasi: " + e.getMessage());
+        } finally {
+            if (kanal != null)
+                kanal.shutdownNow();
+        }
     }
 
     private static void liderDinleyicisiniBaslat(NodeRegistry kayitci, NodeInfo kendim) {
