@@ -24,9 +24,23 @@ message ChatMessage {
   int64 timestamp = 4;
 }
 
+// Dağıtık GET için - diğer düğümlerden değer sorgulama
+message KeyRequest {
+  int32 key = 1;
+}
+
+message ValueResponse {
+  int32 key = 1;
+  string value = 2;
+  bool found = 3;
+}
+
 service FamilyService {
   rpc Join (NodeInfo) returns (FamilyView);
   rpc GetFamily (Empty) returns (FamilyView);
 
   rpc ReceiveChat (ChatMessage) returns (Empty);
+  
+  // Dağıtık GET - diğer düğümlerden değer al
+  rpc GetValue (KeyRequest) returns (ValueResponse);
 }
