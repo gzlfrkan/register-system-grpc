@@ -126,10 +126,13 @@ public class NodeMain {
         System.out.printf("Data Directory: %s%n", veriDizini);
         System.out.println("Started: " + LocalDateTime.now().format(ZAMAN_FORMAT));
 
+        // TCP dinleyiciyi her node'da başlat (hem leader hem follower)
+        tcpDinleyicisiniBaslat(kayitci, kendim);
+
         if (liderMiyim) {
             System.out.println("Role: LEADER");
-            liderDinleyicisiniBaslat(kayitci, kendim);
             liderDuyurusunuBaslat(); // UDP broadcast başlat
+            istatistikYazicisiniBaslat(kayitci, kendim);
         } else {
             System.out.println("Role: FOLLOWER");
             // Lidere bağlan
@@ -137,10 +140,6 @@ public class NodeMain {
         }
 
         System.out.println("------------------------------------------");
-
-        if (liderMiyim) {
-            istatistikYazicisiniBaslat(kayitci, kendim);
-        }
         saglikKontrolunuBaslat(kayitci, kendim);
 
         sunucu.awaitTermination();
@@ -187,12 +186,28 @@ public class NodeMain {
     }
 
     /**
-     * UDP broadcast ile ağda lider arar
+     * Farklı subnet'lerdeki bilgisayarları da bulabilen lider keşfi
+     * 172.20.10.x ve 172.20.11.x gibi komşu subnet'leri tarar
      */
     private static String liderKesfi() {
+        // Önce UDP broadcast dene
+        String lider = udpBroadcastIleAra();
+        if (lider != null)
+            return lider;
+
+        // UDP başarısız olursa, komşu subnet'leri TCP ile tara
+        System.out.println("UDP broadcast yanitlanmadi, komsu subnet'ler taraniyor...");
+        lider = komusuSubnetleriTara();
+        return lider;
+    }
+
+    /**
+     * UDP broadcast ile local subnet'te lider arar
+     */
+    private static String udpBroadcastIleAra() {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
-            socket.setSoTimeout(3000); // 3 saniye bekle
+            socket.setSoTimeout(2000); // 2 saniye bekle
 
             // Broadcast mesajı gönder
             String mesaj = "LEADER_SEARCH";
@@ -217,9 +232,69 @@ public class NodeMain {
             }
 
         } catch (Exception e) {
-            System.err.println("Lider arama hatasi: " + e.getMessage());
+            // UDP hatası - devam et
         }
         return null;
+    }
+
+    /**
+     * Tüm subnet'leri TCP ile tarar (0-255)
+     * Örn: 172.20.x.y formatındaki tüm IP'leri kontrol eder
+     */
+    private static String komusuSubnetleriTara() {
+        String[] ipParcalari = YEREL_ADRES.split("\\.");
+        if (ipParcalari.length != 4)
+            return null;
+
+        String ipBase = ipParcalari[0] + "." + ipParcalari[1] + ".";
+
+        System.out.println("Tum subnetler taraniyor (0-255)...");
+
+        ExecutorService executor = Executors.newFixedThreadPool(100);
+        ConcurrentLinkedQueue<String> bulunanLiderler = new ConcurrentLinkedQueue<>();
+
+        // Tüm subnet'leri tara (0-255)
+        for (int subnet = 0; subnet <= 255; subnet++) {
+            String subnetBase = ipBase + subnet + ".";
+
+            // Her subnet'te 1-254 IP adreslerini paralel olarak tara
+            for (int host = 1; host <= 254; host++) {
+                String hedefIP = subnetBase + host;
+
+                // Kendimi atlama
+                if (hedefIP.equals(YEREL_ADRES))
+                    continue;
+
+                executor.submit(() -> {
+                    if (liderVarMi(hedefIP, BASLANGIC_PORT)) {
+                        bulunanLiderler.add(hedefIP);
+                    }
+                });
+            }
+        }
+
+        executor.shutdown();
+        try {
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        return bulunanLiderler.poll();
+    }
+
+    /**
+     * Belirli bir IP:port'ta lider olup olmadığını kontrol eder
+     */
+    private static boolean liderVarMi(String ip, int port) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new java.net.InetSocketAddress(ip, port), 200); // 200ms timeout
+            socket.close();
+            System.out.printf("Lider bulundu: %s:%d%n", ip, port);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
@@ -284,7 +359,7 @@ public class NodeMain {
         }
     }
 
-    private static void liderDinleyicisiniBaslat(NodeRegistry kayitci, NodeInfo kendim) {
+    private static void tcpDinleyicisiniBaslat(NodeRegistry kayitci, NodeInfo kendim) {
         new Thread(() -> {
             try (ServerSocket dinleyici = new ServerSocket(TCP_DINLEME_PORT)) {
                 System.out.printf("TCP Listening: %s:%d%n", kendim.getHost(), TCP_DINLEME_PORT);
@@ -297,7 +372,7 @@ public class NodeMain {
             } catch (IOException e) {
                 System.err.println("TCP dinleyici hatasi: " + e.getMessage());
             }
-        }, "LiderTcpDinleyici").start();
+        }, "TcpDinleyici").start();
     }
 
     private static void istemciBaglantisiniIsle(Socket istemci, NodeRegistry kayitci, NodeInfo kendim) {
