@@ -35,6 +35,14 @@ message ValueResponse {
   bool found = 3;
 }
 
+// Düğüm depolama bilgisi - boyut bazlı yük dengeleme için
+message StorageInfo {
+  string host = 1;
+  int32 port = 2;
+  int32 fileCount = 3;
+  int64 totalBytes = 4;
+}
+
 service FamilyService {
   rpc Join (NodeInfo) returns (FamilyView);
   rpc GetFamily (Empty) returns (FamilyView);
@@ -43,4 +51,7 @@ service FamilyService {
   
   // Dağıtık GET - diğer düğümlerden değer al
   rpc GetValue (KeyRequest) returns (ValueResponse);
+  
+  // Depolama bilgisi sorgulama - yük dengeleme için
+  rpc GetStorageInfo (Empty) returns (StorageInfo);
 }
