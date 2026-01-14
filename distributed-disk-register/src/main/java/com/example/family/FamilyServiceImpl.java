@@ -127,4 +127,23 @@ public class FamilyServiceImpl extends FamilyServiceGrpc.FamilyServiceImplBase {
         cevapGozlemci.onNext(yanit);
         cevapGozlemci.onCompleted();
     }
+
+    /**
+     * Depolama bilgisi döner - leader'ın yük dengeleme yapabilmesi için
+     */
+    @Override
+    public void getStorageInfo(Empty istek, StreamObserver<family.StorageInfo> cevapGozlemci) {
+        int dosyaSayisi = diskIO.getFileCount();
+        long toplamBoyut = diskIO.getTotalSize();
+
+        family.StorageInfo bilgi = family.StorageInfo.newBuilder()
+                .setHost(kendim.getHost())
+                .setPort(kendim.getPort())
+                .setFileCount(dosyaSayisi)
+                .setTotalBytes(toplamBoyut)
+                .build();
+
+        cevapGozlemci.onNext(bilgi);
+        cevapGozlemci.onCompleted();
+    }
 }

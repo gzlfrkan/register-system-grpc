@@ -29,6 +29,7 @@ import java.util.Enumeration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -54,6 +55,14 @@ public class NodeMain {
     private static DiskIO diskIO;
     private static int tolerance = 1; // Kaç düğüme replike edilecek
     private static volatile boolean liderMiyim = false;
+
+    // Leader için: hangi veri hangi üyelerde tutulduğunun takibi
+    // Anahtar: mesaj ID, Değer: üye listesi (host:port formatında)
+    private static ConcurrentHashMap<Integer, List<String>> veriKonumlari = new ConcurrentHashMap<>();
+
+    // Leader için: follower'ların boyut cache'i (yük dengeleme için)
+    // Anahtar: host:port, Değer: toplam byte boyutu
+    private static ConcurrentHashMap<String, Long> followerBoyutlari = new ConcurrentHashMap<>();
 
     public static void main(String[] args) throws Exception {
         // Gerçek ağ IP adresini bul
@@ -133,10 +142,13 @@ public class NodeMain {
             System.out.println("Role: LEADER");
             liderDuyurusunuBaslat(); // UDP broadcast başlat
             istatistikYazicisiniBaslat(kayitci, kendim);
+            boyutCacheGuncelleyicisiniBaslat(kayitci, kendim); // Yük dengeleme için
         } else {
             System.out.println("Role: FOLLOWER");
             // Lidere bağlan
             lidereBaglan(LIDER_ADRES, kayitci, kendim);
+            // Follower istatistiklerini başlat
+            followerIstatistikYazicisiniBaslat(kayitci, kendim);
         }
 
         System.out.println("------------------------------------------");
@@ -420,21 +432,29 @@ public class NodeMain {
                 }
                 String deger = parcalar[2];
 
-                // Yerel belleğe kaydet
-                bellek.put(anahtar, deger);
+                if (liderMiyim) {
+                    // LEADER: Sadece follower'lara replike et, kendisi dosya tutmaz
+                    toplamSetSayisi.incrementAndGet();
+                    System.out.printf("[SET] %d (%d B) -> follower'lara replike ediliyor%n",
+                            anahtar, deger.length());
 
-                // Yerel diske kaydet ve süreyi ölç
-                long yazmaSuresi = diskIO.write(anahtar, deger);
-                toplamYazmaSuresi.addAndGet(yazmaSuresi);
-                toplamSetSayisi.incrementAndGet();
+                    int replikeSayisi = replikasyonYap(kayitci, kendim, anahtar, deger);
+                    basariliReplikasyon.addAndGet(replikeSayisi);
 
-                // Konsola yaz (kısa)
-                System.out.printf("[SET] %d (%d B) disk: %d us%n",
-                        anahtar, deger.length(), yazmaSuresi);
+                    if (replikeSayisi == 0) {
+                        return "ERROR No available followers for replication";
+                    }
+                } else {
+                    // FOLLOWER: Yerel belleğe ve diske kaydet
+                    bellek.put(anahtar, deger);
 
-                // Diğer düğümlere replike et
-                int replikeSayisi = replikasyonYap(kayitci, kendim, anahtar, deger);
-                basariliReplikasyon.addAndGet(replikeSayisi);
+                    long yazmaSuresi = diskIO.write(anahtar, deger);
+                    toplamYazmaSuresi.addAndGet(yazmaSuresi);
+                    toplamSetSayisi.incrementAndGet();
+
+                    System.out.printf("[SET] %d (%d B) disk: %d us%n",
+                            anahtar, deger.length(), yazmaSuresi);
+                }
 
                 return "OK";
 
@@ -442,23 +462,29 @@ public class NodeMain {
                 toplamGetSayisi.incrementAndGet();
                 long baslangic = System.nanoTime();
 
-                // Önce yerel bellekte ara
-                String deger = bellek.get(anahtar);
+                String deger = null;
 
-                // Yerel bellekte yoksa yerel diskten oku
-                if (deger == null) {
-                    deger = diskIO.read(anahtar);
-                    if (deger != null) {
-                        bellek.put(anahtar, deger);
-                    }
-                }
-
-                // Yerel bulunamadıysa diğer düğümlerden sor
-                if (deger == null) {
+                if (liderMiyim) {
+                    // LEADER: Doğrudan follower'lardan al, yerel disk/bellek yok
                     deger = digerDugumlerdenAl(kayitci, kendim, anahtar);
-                    if (deger != null) {
-                        // Yerel cache'e kaydet
-                        bellek.put(anahtar, deger);
+                } else {
+                    // FOLLOWER: Önce yerel bellekte ara
+                    deger = bellek.get(anahtar);
+
+                    // Yerel bellekte yoksa yerel diskten oku
+                    if (deger == null) {
+                        deger = diskIO.read(anahtar);
+                        if (deger != null) {
+                            bellek.put(anahtar, deger);
+                        }
+                    }
+
+                    // Yerel bulunamadıysa diğer düğümlerden sor
+                    if (deger == null) {
+                        deger = digerDugumlerdenAl(kayitci, kendim, anahtar);
+                        if (deger != null) {
+                            bellek.put(anahtar, deger);
+                        }
                     }
                 }
 
@@ -487,20 +513,17 @@ public class NodeMain {
 
     /**
      * Veriyi diğer düğümlere replike eder (tolerance kadar)
+     * En az dolu üyeleri seçer, başarılı replikasyonları veriKonumlari map'ine
+     * kaydeder
      */
     private static int replikasyonYap(NodeRegistry kayitci, NodeInfo kendim, int anahtar, String deger) {
-        List<NodeInfo> uyeler = kayitci.snapshot();
+        // En az dolu üyeleri seç (boyut bazlı yük dengeleme)
+        List<NodeInfo> seciliUyeler = enAzDoluUyeleriSec(kayitci, kendim, tolerance);
+
         int replikeSayisi = 0;
+        List<String> basariliUyeler = new ArrayList<>();
 
-        for (NodeInfo uye : uyeler) {
-            if (uye.getHost().equals(kendim.getHost()) && uye.getPort() == kendim.getPort()) {
-                continue;
-            }
-
-            if (replikeSayisi >= tolerance) {
-                break; // Yeterli replika yapıldı
-            }
-
+        for (NodeInfo uye : seciliUyeler) {
             ManagedChannel kanal = null;
             try {
                 kanal = ManagedChannelBuilder
@@ -520,12 +543,26 @@ public class NodeMain {
                 stub.receiveChat(mesaj);
                 replikeSayisi++;
 
+                // Başarılı üyeyi kaydet ve o anda ekrana yaz
+                String uyeAdresi = uye.getHost() + ":" + uye.getPort();
+                long uyeBoyutu = followerBoyutlari.getOrDefault(uyeAdresi, 0L);
+                basariliUyeler.add(uyeAdresi);
+                System.out.printf("[REPLIKASYON] SET %d (%d B) -> %s (mevcut: %s) basarili%n",
+                        anahtar, deger.length(), uyeAdresi, formatSize(uyeBoyutu));
+
             } catch (Exception e) {
-                // Düğüm erişilemez - devam et
+                System.out.printf("[REPLIKASYON] SET %d -> %s:%d BASARISIZ: %s%n",
+                        anahtar, uye.getHost(), uye.getPort(), e.getMessage());
             } finally {
                 if (kanal != null)
                     kanal.shutdownNow();
             }
+        }
+
+        // Veri konumlarını kaydet (sadece leader için)
+        if (!basariliUyeler.isEmpty()) {
+            veriKonumlari.put(anahtar, basariliUyeler);
+            System.out.printf("[KONUM] Anahtar %d -> %s%n", anahtar, basariliUyeler);
         }
 
         return replikeSayisi;
@@ -533,8 +570,28 @@ public class NodeMain {
 
     /**
      * Yerel bulunamayan veriyi diğer düğümlerden alır
+     * Önce veriKonumlari map'ine bakar, yoksa tüm üyeleri tarar
      */
     private static String digerDugumlerdenAl(NodeRegistry kayitci, NodeInfo kendim, int anahtar) {
+        // Önce bilinen konumlara bak (leader için optimize)
+        List<String> bilinenKonumlar = veriKonumlari.get(anahtar);
+
+        if (bilinenKonumlar != null && !bilinenKonumlar.isEmpty()) {
+            System.out.printf("[GET] Anahtar %d icin bilinen konumlar: %s%n", anahtar, bilinenKonumlar);
+
+            for (String konum : bilinenKonumlar) {
+                String[] parcalar = konum.split(":");
+                String host = parcalar[0];
+                int port = Integer.parseInt(parcalar[1]);
+
+                String sonuc = dugumdenVeriAl(host, port, anahtar);
+                if (sonuc != null) {
+                    return sonuc;
+                }
+            }
+        }
+
+        // Bilinen konum yoksa veya bulunamadıysa tüm üyeleri tara
         List<NodeInfo> uyeler = kayitci.snapshot();
 
         for (NodeInfo uye : uyeler) {
@@ -542,35 +599,45 @@ public class NodeMain {
                 continue;
             }
 
-            ManagedChannel kanal = null;
-            try {
-                kanal = ManagedChannelBuilder
-                        .forAddress(uye.getHost(), uye.getPort())
-                        .usePlaintext()
-                        .build();
-
-                FamilyServiceGrpc.FamilyServiceBlockingStub stub = FamilyServiceGrpc.newBlockingStub(kanal);
-
-                KeyRequest istek = KeyRequest.newBuilder()
-                        .setKey(anahtar)
-                        .build();
-
-                ValueResponse yanit = stub.getValue(istek);
-
-                if (yanit.getFound()) {
-                    System.out.printf("[GET] %d -> %s:%d uzerinden bulundu%n",
-                            anahtar, uye.getHost(), uye.getPort());
-                    return yanit.getValue();
-                }
-
-            } catch (Exception e) {
-                // Düğüm erişilemez - devam et
-            } finally {
-                if (kanal != null)
-                    kanal.shutdownNow();
+            String sonuc = dugumdenVeriAl(uye.getHost(), uye.getPort(), anahtar);
+            if (sonuc != null) {
+                return sonuc;
             }
         }
 
+        return null;
+    }
+
+    /**
+     * Belirli bir düğümden veri almaya çalışır
+     */
+    private static String dugumdenVeriAl(String host, int port, int anahtar) {
+        ManagedChannel kanal = null;
+        try {
+            kanal = ManagedChannelBuilder
+                    .forAddress(host, port)
+                    .usePlaintext()
+                    .build();
+
+            FamilyServiceGrpc.FamilyServiceBlockingStub stub = FamilyServiceGrpc.newBlockingStub(kanal);
+
+            KeyRequest istek = KeyRequest.newBuilder()
+                    .setKey(anahtar)
+                    .build();
+
+            ValueResponse yanit = stub.getValue(istek);
+
+            if (yanit.getFound()) {
+                System.out.printf("[GET] %d -> %s:%d uzerinden bulundu%n", anahtar, host, port);
+                return yanit.getValue();
+            }
+
+        } catch (Exception e) {
+            // Düğüm erişilemez - devam et
+        } finally {
+            if (kanal != null)
+                kanal.shutdownNow();
+        }
         return null;
     }
 
@@ -644,11 +711,126 @@ public class NodeMain {
             for (NodeInfo uye : uyeler) {
                 boolean benMiyim = uye.getHost().equals(kendim.getHost()) && uye.getPort() == kendim.getPort();
                 System.out.printf("|   - %s:%-5d %-23s|%n",
-                        uye.getHost(), uye.getPort(), benMiyim ? "(ME)" : "");
+                        uye.getHost(), uye.getPort(), benMiyim ? "(LEADER)" : "");
+            }
+            System.out.println("+------------------------------------------+");
+            // Follower boyutları (cache)
+            if (!followerBoyutlari.isEmpty()) {
+                System.out.println("| FOLLOWER STORAGE (Cache):                |");
+                followerBoyutlari
+                        .forEach((adres, boyut) -> System.out.printf("|   - %-20s %15s |%n", adres, formatSize(boyut)));
+                System.out.println("+------------------------------------------+");
+            }
+
+        }, 3, YAZDIR_ARALIK_SANIYE, TimeUnit.SECONDS);
+    }
+
+    private static void followerIstatistikYazicisiniBaslat(NodeRegistry kayitci, NodeInfo kendim) {
+        ScheduledExecutorService zamanlayici = Executors.newSingleThreadScheduledExecutor();
+
+        zamanlayici.scheduleAtFixedRate(() -> {
+            int dosyaSayisi = diskIO.getFileCount();
+            long toplamBoyut = diskIO.getTotalSize();
+            long setSayisi = toplamSetSayisi.get();
+            long getSayisi = toplamGetSayisi.get();
+            long yazmaSuresi = toplamYazmaSuresi.get();
+            long okumaSuresi = toplamOkumaSuresi.get();
+
+            System.out.println();
+            System.out.println("+------------------------------------------+");
+            System.out.println("|       FOLLOWER STORAGE STATISTICS        |");
+            System.out.println("+------------------------------------------+");
+            System.out.printf("| Node: %s:%-26d|%n", kendim.getHost(), kendim.getPort());
+            System.out.printf("| Data Dir: %-31s|%n", diskIO.getDataDirectory());
+            System.out.printf("| Time: %-34s|%n", LocalDateTime.now().format(ZAMAN_FORMAT));
+            System.out.println("+------------------------------------------+");
+            System.out.printf("| Files on Disk: %-26d|%n", dosyaSayisi);
+            System.out.printf("| Total Size: %-26s|%n", formatSize(toplamBoyut));
+            System.out.printf("| Records in Memory: %-22d|%n", bellek.size());
+            System.out.println("+------------------------------------------+");
+            System.out.printf("| SET Received: %-27d|%n", setSayisi);
+            System.out.printf("| GET Received: %-27d|%n", getSayisi);
+            if (setSayisi > 0) {
+                System.out.printf("| Avg Write Time: %-22d us |%n", yazmaSuresi / setSayisi);
+            }
+            if (getSayisi > 0) {
+                System.out.printf("| Avg Read Time: %-23d us |%n", okumaSuresi / getSayisi);
             }
             System.out.println("+------------------------------------------+");
 
         }, 3, YAZDIR_ARALIK_SANIYE, TimeUnit.SECONDS);
+    }
+
+    private static String formatSize(long bytes) {
+        if (bytes < 1024)
+            return bytes + " B";
+        if (bytes < 1024 * 1024)
+            return String.format("%.2f KB", bytes / 1024.0);
+        return String.format("%.2f MB", bytes / (1024.0 * 1024));
+    }
+
+    /**
+     * Follower boyutlarını periyodik olarak cache'ler (yük dengeleme için)
+     */
+    private static void boyutCacheGuncelleyicisiniBaslat(NodeRegistry kayitci, NodeInfo kendim) {
+        ScheduledExecutorService zamanlayici = Executors.newSingleThreadScheduledExecutor();
+
+        zamanlayici.scheduleAtFixedRate(() -> {
+            List<NodeInfo> uyeler = kayitci.snapshot();
+
+            for (NodeInfo uye : uyeler) {
+                if (uye.getHost().equals(kendim.getHost()) && uye.getPort() == kendim.getPort()) {
+                    continue;
+                }
+
+                ManagedChannel kanal = null;
+                try {
+                    kanal = ManagedChannelBuilder
+                            .forAddress(uye.getHost(), uye.getPort())
+                            .usePlaintext()
+                            .build();
+
+                    FamilyServiceGrpc.FamilyServiceBlockingStub stub = FamilyServiceGrpc.newBlockingStub(kanal);
+                    family.StorageInfo bilgi = stub.getStorageInfo(Empty.newBuilder().build());
+
+                    String uyeAdresi = uye.getHost() + ":" + uye.getPort();
+                    followerBoyutlari.put(uyeAdresi, bilgi.getTotalBytes());
+
+                } catch (Exception e) {
+                    // Düğüm erişilemez - cache'den çıkartma
+                    String uyeAdresi = uye.getHost() + ":" + uye.getPort();
+                    followerBoyutlari.remove(uyeAdresi);
+                } finally {
+                    if (kanal != null)
+                        kanal.shutdownNow();
+                }
+            }
+
+        }, 2, 5, TimeUnit.SECONDS); // 2 saniye sonra başla, 5 saniyede bir güncelle
+    }
+
+    /**
+     * En az dolu olan üyeleri seçer (tolerance kadar)
+     */
+    private static List<NodeInfo> enAzDoluUyeleriSec(NodeRegistry kayitci, NodeInfo kendim, int limit) {
+        List<NodeInfo> uyeler = kayitci.snapshot();
+
+        // Kendimi çıkar
+        uyeler = uyeler.stream()
+                .filter(uye -> !(uye.getHost().equals(kendim.getHost()) && uye.getPort() == kendim.getPort()))
+                .collect(java.util.stream.Collectors.toList());
+
+        // Boyuta göre sırala (en az dolu önce)
+        uyeler.sort((a, b) -> {
+            String adresA = a.getHost() + ":" + a.getPort();
+            String adresB = b.getHost() + ":" + b.getPort();
+            long boyutA = followerBoyutlari.getOrDefault(adresA, 0L);
+            long boyutB = followerBoyutlari.getOrDefault(adresB, 0L);
+            return Long.compare(boyutA, boyutB);
+        });
+
+        // İlk 'limit' kadar üye döndür
+        return uyeler.stream().limit(limit).collect(java.util.stream.Collectors.toList());
     }
 
     private static void saglikKontrolunuBaslat(NodeRegistry kayitci, NodeInfo kendim) {

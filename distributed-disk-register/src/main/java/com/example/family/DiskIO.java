@@ -158,4 +158,36 @@ public class DiskIO {
     public boolean exists(int anahtar) {
         return new File(veriDizini, anahtar + ".msg").exists();
     }
+
+    /**
+     * Diskteki toplam dosya sayısını döndürür
+     */
+    public int getFileCount() {
+        File klasor = new File(veriDizini);
+        File[] dosyalar = klasor.listFiles((dir, name) -> name.endsWith(".msg"));
+        return dosyalar != null ? dosyalar.length : 0;
+    }
+
+    /**
+     * Diskteki toplam dosya boyutunu byte cinsinden döndürür
+     */
+    public long getTotalSize() {
+        File klasor = new File(veriDizini);
+        File[] dosyalar = klasor.listFiles((dir, name) -> name.endsWith(".msg"));
+        if (dosyalar == null)
+            return 0;
+
+        long toplam = 0;
+        for (File dosya : dosyalar) {
+            toplam += dosya.length();
+        }
+        return toplam;
+    }
+
+    /**
+     * Veri dizinini döndürür
+     */
+    public String getDataDirectory() {
+        return veriDizini;
+    }
 }
