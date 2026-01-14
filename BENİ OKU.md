@@ -1,6 +1,6 @@
 # Distributed Disk Register System
 
-A distributed key-value storage system with automatic replication, multiple I/O modes, and fault tolerance.
+A distributed key-value storage system with automatic replication, intelligent load balancing, and fault tolerance.
 
 ---
 
@@ -14,31 +14,36 @@ A distributed key-value storage system with automatic replication, multiple I/O 
 | **Fault Tolerance** | If a node fails, data is retrieved from other nodes |
 | **Auto Discovery** | New nodes automatically find and join the cluster |
 | **Health Monitoring** | Nodes are checked every 10 seconds, failed nodes are removed |
+| **Leader Coordination** | Leader does NOT store files, only manages replication |
+| **Location Tracking** | Leader tracks which data is stored on which followers |
+| **Least-Loaded Distribution** | New data goes to followers with least storage usage |
 
 ---
 
 ## System Architecture
-
 ```
 ┌──────────────────┐
 │  HaToKuSe Client │  Sends SET/GET commands
 └────────┬─────────┘
          │ TCP (port 6666)
          ▼
-┌──────────────────────────────────────────────┐
-│           LEADER NODE (port 5555)            │
-│  • TCP Server: Receives client requests      │
-│  • DiskIO: Writes to disk using selected mode│
-│  • gRPC: Communicates with other nodes       │
-│  • Replication: Copies data to followers     │
-└────────┬─────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│              LEADER NODE (port 5555)                 │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │ • NO local storage (coordination only)         │ │
+│  │ • veriKonumlari: tracks data locations         │ │
+│  │ • followerBoyutlari: caches follower sizes     │ │
+│  │ • Least-Loaded selection for new data          │ │
+│  └─────────────────────────────────────────────────┘ │
+└────────┬─────────────────────────────────────────────┘
          │ gRPC (Protobuf)
-    ┌────┴────┐
-    ▼         ▼
-┌────────┐ ┌────────┐
-│FOLLOWER│ │FOLLOWER│  Each writes to own disk
-│ (5556) │ │ (5557) │  Serves GET requests
-└────────┘ └────────┘
+    ┌────┴────┬────────┐
+    ▼         ▼        ▼
+┌────────┐ ┌────────┐ ┌────────┐
+│FOLLOWER│ │FOLLOWER│ │FOLLOWER│  Each writes to own disk
+│ (5556) │ │ (5557) │ │ (5558) │  Reports storage size
+│ 12.5KB │ │  8.3KB │ │ 15.1KB │  to Leader (cached)
+└────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -51,12 +56,6 @@ A distributed key-value storage system with automatic replication, multiple I/O 
 | **UNBUFFERED** | FileOutputStream + sync() | ~950 us | Maximum data safety |
 | **MEMORY_MAPPED** | MappedByteBuffer (zero-copy) | ~1600 us | Large files |
 
-### How They Differ
-
-- **CLASSIC**: Writes to buffer first, flushes to disk when full
-- **UNBUFFERED**: Every write is immediately synced to disk
-- **MEMORY_MAPPED**: File is mapped directly to memory, bypasses kernel buffer
-
 ---
 
 ## Data Flow
@@ -64,20 +63,38 @@ A distributed key-value storage system with automatic replication, multiple I/O 
 ### SET Command
 ```
 1. Client → Leader: SET 42 ISTANBUL
-2. Leader: Write to memory (ConcurrentHashMap)
-3. Leader: Write to disk (data_5555/42.msg)
-4. Leader → Followers: Replicate via gRPC
+2. Leader: Query followerBoyutlari cache
+3. Leader: Select least-loaded 'tolerance' followers
+4. Leader → Selected Followers: Replicate via gRPC
 5. Followers: Write to memory + disk
-6. Leader → Client: OK
+6. Leader: Update veriKonumlari[42] = [follower1, follower2]
+7. Leader → Client: OK
 ```
 
 ### GET Command
 ```
 1. Client → Leader: GET 42
-2. Leader: Search in memory
-3. If not found → Read from disk
-4. If not on disk → Query other nodes via gRPC
+2. Leader: Check veriKonumlari[42] for known locations
+3. Leader → Known Followers: Query directly (no broadcast)
+4. If not found → Query all followers
 5. Leader → Client: OK ISTANBUL
+```
+
+---
+
+## Least-Loaded Distribution
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Leader every 5 seconds:                            │
+│  1. Query all followers: GetStorageInfo RPC         │
+│  2. Cache their total bytes                         │
+│                                                     │
+│  When SET arrives:                                  │
+│  1. Sort followers by storage size                  │
+│  2. Select 'tolerance' least-loaded ones            │
+│  3. Replicate to those followers                    │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -86,11 +103,11 @@ A distributed key-value storage system with automatic replication, multiple I/O 
 
 | File | Purpose |
 |------|---------|
-| `NodeMain.java` | Main entry, TCP server, command processing, statistics |
-| `DiskIO.java` | Implementation of 3 I/O modes |
-| `FamilyServiceImpl.java` | gRPC service methods, replication handling |
+| `NodeMain.java` | Main entry, TCP server, command processing, statistics, load balancing |
+| `DiskIO.java` | Implementation of 3 I/O modes + file count/size methods |
+| `FamilyServiceImpl.java` | gRPC service methods, replication handling, GetStorageInfo |
 | `NodeRegistry.java` | Node list management |
-| `family.proto` | gRPC protocol definitions |
+| `family.proto` | gRPC protocol definitions + StorageInfo message |
 
 ---
 
@@ -98,69 +115,65 @@ A distributed key-value storage system with automatic replication, multiple I/O 
 
 ### Tek Komutla Başlatma (Önerilen)
 ```powershell
-cd "c:\Users\cooll\Desktop\sistem programlama_cool"
-.\baslat.bat
+cd "c:\Users\cooll\Desktop\sistem programlama_cool\çalıştırma"
+.\baslat.bat          # Leader başlatır
+.\yeni_uye.bat        # Follower başlatır (birden fazla çalıştırılabilir)
+.\komut_gonder.bat    # SET/GET komutları gönderir
 ```
 
-### Farklı Bilgisayarlarda Çalıştırma
-
-**1. Bilgisayar (İlk açan LEADER olur):**
-```powershell
-.\baslat.bat
-```
-
-**2. Bilgisayar (Otomatik FOLLOWER olur):**
-- Aynı klasörü kopyalayın
-- `baslat.bat` çalıştırın
-- Otomatik olarak Leader'ı bulup bağlanacak
-
-> **Not:** Tüm bilgisayarlar aynı ağda (WiFi/LAN) olmalıdır.
-
-### Manuel Başlatma
-```powershell
-cd "c:\Users\cooll\Desktop\sistem programlama_cool\distributed-disk-register"
-.\mvnw.cmd clean compile
-.\mvnw.cmd exec:java "-Dexec.mainClass=com.example.family.NodeMain" "-Dexec.args=--mode=CLASSIC --tolerance=1"
-```
-
-### Manuel Lider Belirtme (Opsiyonel)
-```powershell
-.\mvnw.cmd exec:java "-Dexec.mainClass=com.example.family.NodeMain" "-Dexec.args=--leader=192.168.1.100"
-```
-
-### Test with HaToKuSe Client
-```powershell
-cd "c:\Users\cooll\Desktop\HaToKuSe-Client-main\hatokuse-client"
-java HaToKuSeClient --host=<LEADER_IP> --durationMinutes=30
-```
-
----
-
-## Command Line Options
+### Command Line Options
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--mode=` | CLASSIC | I/O mode selection |
-| `--tolerance=` | 1 | Replication factor (N+1 total copies) |
+| `--mode=` | CLASSIC | I/O mode: CLASSIC, UNBUFFERED, MEMORY_MAPPED |
+| `--tolerance=` | 2 | Replication factor (data stored on N followers) |
+| `--leader=` | auto | Manual leader IP specification |
 
 ---
 
-## Node Roles
+## Sample Output
 
-- **First node started** automatically becomes the **LEADER** (port 5555)
-- All subsequent nodes become **FOLLOWER** nodes
-- Leader handles client TCP connections on port 6666
-- All nodes communicate via gRPC
+### Leader Statistics
+```
++------------------------------------------+
+|         PERFORMANCE STATISTICS           |
++------------------------------------------+
+| Node: 192.168.1.5:5555                   |
+| I/O Mode: CLASSIC                        |
+| Time: 2026-01-14 15:45:00                |
++------------------------------------------+
+| Total SET: 500                           |
+| Total GET: 125                           |
+| Records in Memory: 0                     |
+| Successful Replications: 1000            |
++------------------------------------------+
+| Active Nodes: 3                          |
+|   - 192.168.1.5:5555 (LEADER)            |
+|   - 192.168.1.5:5556                     |
+|   - 192.168.1.5:5557                     |
++------------------------------------------+
+| FOLLOWER STORAGE (Cache):                |
+|   - 192.168.1.5:5556        12.50 KB     |
+|   - 192.168.1.5:5557         8.30 KB     |
++------------------------------------------+
+```
 
----
-
-## Replication
-
-With `--tolerance=1`:
-- Data is stored on 2 nodes (Leader + 1 Follower)
-
-With `--tolerance=2`:
-- Data is stored on 3 nodes (Leader + 2 Followers)
+### Follower Statistics
+```
++------------------------------------------+
+|       FOLLOWER STORAGE STATISTICS        |
++------------------------------------------+
+| Node: 192.168.1.5:5556                   |
+| Data Dir: data_192_168_1_5_5556          |
++------------------------------------------+
+| Files on Disk: 250                       |
+| Total Size: 12.50 KB                     |
+| Records in Memory: 250                   |
++------------------------------------------+
+| SET Received: 250                        |
+| GET Received: 50                         |
++------------------------------------------+
+```
 
 ---
 
@@ -172,43 +185,8 @@ With `--tolerance=2`:
 | Client-Server | TCP Socket |
 | Disk I/O | BufferedIO / Direct / NIO MappedByteBuffer |
 | Memory Store | ConcurrentHashMap |
+| Load Balancing | Size-based Least-Loaded Selection |
 | Build System | Maven |
-
----
-
-## Sample Output
-
-```
-==========================================
-  DISTRIBUTED SYSTEM - COOL VERSION v2.0
-  HaToKuSe Compatible + Replication + I/O Modes
-==========================================
-Node: 127.0.0.1:5555
-I/O Mode: CLASSIC
-Tolerance: 1 (data copied to 2 nodes)
-Data Directory: data_5555
-Started: 2026-01-08 18:16:35
-Role: LEADER
-------------------------------------------
-TCP Listening: 127.0.0.1:6666
-
-+------------------------------------------+
-|         PERFORMANCE STATISTICS           |
-+------------------------------------------+
-| Node: 127.0.0.1:5555                     |
-| I/O Mode: CLASSIC                        |
-| Total SET: 1542                          |
-| Total GET: 389                           |
-| Records in Memory: 50                    |
-| Successful Replications: 1542            |
-| Avg Write Time: 423 us                   |
-| Avg Read Time: 2 us                      |
-| Active Nodes: 3                          |
-|   - 127.0.0.1:5555  (ME)                 |
-|   - 127.0.0.1:5556                       |
-|   - 127.0.0.1:5557                       |
-+------------------------------------------+
-```
 
 ---
 
