@@ -1,0 +1,1 @@
+baslat.bat ve yeni_üye.bat dosyalarını çalıştırmadan önce içerisindeki cd komutunun path'ini değiştirip çalıştırınız.
